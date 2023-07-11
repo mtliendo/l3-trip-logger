@@ -1,3 +1,4 @@
+import { createTripTableStream } from './functions/tripTableStream/construct'
 import * as cdk from 'aws-cdk-lib'
 import { createAmplifyGraphqlApi } from './api/appsync'
 import { CDKContext } from '../cdk.context'
@@ -30,5 +31,14 @@ export class BackendStack extends cdk.Stack {
 			unauthenticatedRole: cognitoIdentity.unauthenticatedRole,
 			identityPoolId: cognitoIdentity.identityPoolId,
 		})
+
+		const tripTableStreamFunc = createTripTableStream(this, {
+			appName: context.appName,
+			tripTable: amplifyApi.tripTable,
+			fnName: context.functions.tripTableStream.name,
+			environmentVars: {},
+		})
+
+		amplifyApi.tripTable.grantStreamRead(tripTableStreamFunc)
 	}
 }

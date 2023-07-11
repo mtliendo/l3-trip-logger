@@ -8,6 +8,11 @@
 			"poolName": "trip-pool",
 			"clientName": "trip-client",
 			"identityName": "trip-identity"
+		},
+		"functions": {
+			"tripTableStream": {
+				"name": "trip-table-stream"
+			}
 		}
 	}
 }

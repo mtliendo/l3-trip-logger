@@ -12,3 +12,7 @@ type Trip
 	description: String!
 	imgKey: String!
 }
+
+type Mutation {
+	batchUploadPipeline: String
+}

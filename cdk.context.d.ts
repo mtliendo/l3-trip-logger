@@ -8,4 +8,9 @@ export type CDKContext = {
 		clientName: string
 		identityName: string
 	}
+	functions: {
+		tripTableStream: {
+			name: string
+		}
+	}
 }

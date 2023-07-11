@@ -311,3 +311,209 @@ I could've swore I reported this.
 > 🗒️ update: I reported x-ray not being enabled by default, not cloudwatch logging.
 
 With resolver code being generated on our behalf we 100% want a way to enable logging at the main level.
+
+Sooo, I'm not seeing a way to do this on the main API, but the promise here is that we can drop down to the L2 construct at any point. So let's do that.
+
+A 15 minute rabbit hole led me down a path where I learned that AppSync/Cloudformation does't have to way to pass a `LogConfig` _after_ an API has been created 😮
+
+This is good to know because we can't promise users they can just drop down to the L2 construct if there are situations like these that require click-ops.
+
+## DynamoDB Destroy policy
+
+When I run `cdk destroy` I want my tables to be deleted since I'm in my Sandbox account. Let's see how I can access those and modify them.
+
+![table node](./notes-images/table.png)
+
+Hmm...This is a common task and it's not apparent how this would work.
+In my mind, I would almost expect a file to be printed out, or a CLI command to run that would tell me what the logical ID's are..hmmm...but then again, that would only work for local environments. There needs to be a programmatic way of doing this for ci/cd pipelines.
+
+In the AWS Console, the name of my table is: `Trip-k5jh6v5afnc4rokqkozggytaui-NONE` I'm assuming this is the default logical ID.
+
+> 🗒️ I had to do a double take due to `datasources` also being an option and having to think about if that's the way to get to the table.
+
+If I log out the following:
+
+```ts
+api.resources.cfnDataSources
+```
+
+and then deploy, I can see a generated logical id of
+
+```ts
+'${Token[AmplifyCdkConstructSampleStack.trip-logger-trip-api.RootStack.Trip.Trip.TripTable.LogicalID.1050]}'
+```
+
+But after looking through, I also see this:
+![_logicalid override](./notes-images/id-override.png)
+
+Definitely not ideal, and beyond what we could expect customers to do, but I'm going to give it a shot...
+
+It worked!🎉
+
+> So safe to assume the formula is `${NAME_OF_APPSYNC_MODEL}Table`? We should definitely document this if so.
+
+![Found table](./notes-images/found-table.png)
+
+This would of course need to be easier. The biggest downside is that I'm in L1 territory, but then again, since I'm working with servies that have already been created, maybe it won't be so bad. Let's see..
+
+```ts
+const L1TripTable = api.resources.cfnTables['TripTable']
+L1TripTable.applyRemovalPolicy(RemovalPolicy.DESTROY)
+```
+
+Not so bad 😄
+oh, this is the default anyways 😅
+
+## Enable DynamoDB Stream
+
+Now that I know how to access the table, this shouldn't be so hard. But I want to do this because I'm curious about how this will affect my code organization.
+
+I'll start by enabling the stream for new images. Typically I have a `databases` folder, but it makes sense to keep this stuff in the `lib/api/appsync.ts` file.
+
+```ts
+L1TripTable.streamSpecification = {
+	streamViewType: StreamViewType.NEW_IMAGE,
+}
+```
+
+So far so good.
+
+Now to add the Lambda function.
+
+```ts
+`lib/functions/tripTableStream/construct.ts'
+```
+
+For the code, I'm going to refactor an [earlier example](https://github.com/focusOtter/microsaas-backend/blob/main/lib/functions/addUserPostConfirmation/construct.ts) I have that was used as a `postConfirmation` trigger.
+
+Things were going relatively well until I needed to pass my Lambda function an ITable as an event source but what Amplify gives me is an cfnTable.
+
+![cfn table](./notes-images/cfnTable.png)
+
+I had to chatGPT this one, but it wasn't too tough, I can reference the ARN of the table to recreate the L2 construct:
+
+```ts
+const table = dynamodb.Table.fromTableArn(stack, 'MyTableRef', cfnTable.attrArn)
+```
+
+So this code works:
+
+```ts
+const L1TripTable = api.resources.cfnTables['TripTable']
+const TripTable = Table.fromTableArn(scope, 'TripTableL2', L1TripTable.attrArn)
+
+L1TripTable.applyRemovalPolicy(RemovalPolicy.DESTROY)
+
+L1TripTable.streamSpecification = {
+	streamViewType: StreamViewType.NEW_IMAGE,
+}
+
+return { api, TripTable }
+```
+
+The problem is that now my single-deploy project is broken since in order to get the L2 construct, the table has to be deployed first. This further shows the need to provide the L2 construct to customers.
+
+## Adding a Mutation to an Existing Table
+
+This is common enough: Amplify generated my CRUDL operations but now I want to add another operation on an existing datasource. A common scenario here is adding batching support so that users can create more than one item at a time.
+
+I looked in the AWS Console to verify much hunch: The datasource is named the same as the table's overridden logical ID.
+
+So in my case, the datasource is named `TripTable`.
+
+I simply added the following:
+
+```ts
+const tripTableDS = api.resources.cfnDataSources['TripTable']
+appSyncApi.createResolver('BatchUploadPipeline', {
+	runtime: awsAppsync.FunctionRuntime.JS_1_0_0,
+	typeName: 'Mutation',
+	fieldName: 'batchUploadPipeline',
+	dataSource: tripTableDS,
+	pipelineConfig: [],
+})
+```
+
+This doesn't work because `tripTableDS` is an L1 construct and the datasource needs a `BaseDatasource`.
+
+hmmm....I think the only way around this is to create a new datasource that maps to the existing table.
+
+Would I like to use the same datasource...yes. Does it also make sense to have a different datasource so that's there's a distinction between the one the construct generated and my custom one...also yes.
+
+For the new datasource, I gave it the same name as the one the L3 construct created + "Extended".
+
+```ts
+const tripTableDS = appSyncApi.addDynamoDbDataSource(
+	'TripTableExtended',
+	tripTable
+)
+```
+
+This meant I had to get an L2 construct of the table:
+
+```ts
+const L1TripTable = api.resources.cfnTables['TripTable']
+const tripTable = Table.fromTableArn(scope, 'TripTableL2', L1TripTable.attrArn)
+```
+
+From there I can create my resolver as usual, passing in the `tableName` as an environment variable.
+
+```ts
+appSyncApi.createResolver('BatchUploadPipeline', {
+	runtime: awsAppsync.FunctionRuntime.JS_1_0_0,
+	typeName: 'Mutation',
+	code: awsAppsync.Code.fromInline(`
+	// The before step.
+	//This runs before ALL the AppSync functions in this pipeline.
+	export function request(ctx) {
+		console.log(ctx.args)
+		ctx.stash.tableName = "${tripTable.tableName}"
+		return {}
+	}
+
+	// The AFTER step. This runs after ALL the AppSync functions in this pipeline.
+	export function response(ctx) {
+		return ctx.prev.result
+	}
+	`),
+	fieldName: 'batchUploadPipeline',
+	dataSource: tripTableDS,
+	pipelineConfig: [
+		//where I would put the batch upload functions
+	],
+})
+```
+
+## Deploying
+
+I want this to deploy, but I'm not going to test it because I'm pretty sure my table needs to give my function permission to read the stream and I just don't feel like moving files around.
+
+Initial deploy: failed due to my Lambda being written in Typescript and I forgot to install `esbuild` as a dev dependency (not needed if you have docker installed, but I'm not a docker boi)
+
+`npm i -D esbuild`
+
+Second attempt: `Error: DynamoDB Streams must be enabled on the table AmplifyCdkConstructSampleStack/TripTableL2`
+
+Here we go... 😩
+
+Alright, I have this:
+
+```ts
+L1TripTable.streamSpecification = {
+	streamViewType: StreamViewType.NEW_IMAGE,
+}
+```
+
+But I'm assuming I need something else...
+
+Update1: 10 minutes later and I'm learning that if you don't enable streams when the db is first created, then the only options are basically to
+
+1. Create a new db with streams enabled or
+2. enable it in the console.
+3. use the SDK or CLI
+
+But there is not a non-disrutpive way of doing it with CloudFormation
+
+update2: Curious what the default is and sure enough, the day is saved because the L3 construct enables `NEW_AND_OLD` stream records by default 😅. I'm gonna remove that reference in my code and redeploy.
+
+I spent an hour on this and I got my custom appsync code to deploy but never got the stream to deploy.
