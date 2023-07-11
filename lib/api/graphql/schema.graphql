@@ -1,0 +1,14 @@
+type Trip
+	@model
+	@auth(
+		rules: [
+			{ allow: owner }
+			{ allow: public, provider: iam, operations: [read] }
+		]
+	) {
+	id: ID!
+	owner: String @auth(rules: [{ allow: owner, operations: [read, delete] }])
+	title: String!
+	description: String!
+	imgKey: String!
+}

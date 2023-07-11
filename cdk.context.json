@@ -1,0 +1,13 @@
+{
+	"globals": {
+		"appName": "trip-logger",
+		"api": {
+			"name": "trip-api"
+		},
+		"auth": {
+			"poolName": "trip-pool",
+			"clientName": "trip-client",
+			"identityName": "trip-identity"
+		}
+	}
+}
